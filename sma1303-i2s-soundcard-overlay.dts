@@ -1,0 +1,66 @@
+/*
+ * Definitions for SMA1303 Amp
+ * name : sma1303-i2s-soundcard-overlay.dts
+ * Compile for dts
+ * dtc -@ -I dts -O dtb -o sma1303-i2s-soundcard.dtbo sma1303-i2s-soundcard-overlay.dts
+ * sudo cp sma1303-i2s-soundcard.dtbo /boot/overlays
+ * adding dtoverlay sma1303-i2s-soundcard.dtbo in config.txt
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2708";
+
+	fragment@0 {
+		target = <&i2s>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@1 {
+		target = <&i2c1>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			status = "okay";
+
+			sma1303_amp: sma1303@1e {
+				#sound-dai-cells = <0>;
+
+				compatible = "siliconmitus,sma1303";
+				reg = <0x1e>;
+				init-vol = <0x31>;
+				//stereo-two-chip;
+				/* EXTERNAL_CLOCK_19_2   : 0x00,
+				 * EXTERNAL_CLOCK_24_576 : 0x01,
+				 * PLL_CLKIN_MCLK        : 0x02,
+				 * PLL_CLKIN_BCLK        : 0x03
+				 */
+				sys-clk-id = <0x03>;
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@2 {
+		target = <&sound>;
+		__overlay__ {
+			compatible = "simple-audio-card";
+			simple-audio-card,name = "sma1303_soundcard";
+			simple-audio-card,format = "i2s";
+			simple-audio-card,bitclock-slave = <&codec_dai>;
+			simple-audio-card,frame-slave = <&codec_dai>;
+			status = "okay";
+			cpu_dai: simple-audio-card,cpu {
+				sound-dai = <&i2s>;
+			};
+			codec_dai: simple-audio-card,codec {
+				sound-dai = <&sma1303_amp>;
+			};
+		};
+	};
+};
