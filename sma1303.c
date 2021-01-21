@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* sma1303.c -- sma1303 ALSA SoC Audio driver
  *
- * r016, 2020.07.16	- initial version  sma1303
+ * r017, 2021.01.19	- initial version  sma1303
  *
  * Copyright 2019 Silicon Mitus Corporation / Iron Device Corporation
  *
@@ -91,6 +91,7 @@ struct sma1303_priv {
 	unsigned int last_over_temp;
 	unsigned int last_ocp_val;
 	unsigned int last_bclk;
+	unsigned int frame_size;
 };
 
 static struct sma1303_pll_match sma1303_pll_matches[] = {
@@ -172,6 +173,8 @@ static const struct reg_default sma1303_reg_def[] = {
 
 static bool sma1303_readable_register(struct device *dev, unsigned int reg)
 {
+	bool result;
+
 	if (reg > SMA1303_FF_DEVICE_INDEX)
 		return false;
 
@@ -188,15 +191,21 @@ static bool sma1303_readable_register(struct device *dev, unsigned int reg)
 	case SMA1303_94_BOOST_CTRL1 ... SMA1303_97_BOOST_CTRL4:
 	case SMA1303_A0_PAD_CTRL0 ... SMA1303_A7_CLK_MON:
 	case SMA1303_FA_STATUS1 ... SMA1303_FB_STATUS2:
+		result = true;
+		break;
 	case SMA1303_FF_DEVICE_INDEX:
-		return true;
+		result = true;
+		break;
 	default:
-		return false;
+		result = false;
 	}
+	return result;
 }
 
 static bool sma1303_writeable_register(struct device *dev, unsigned int reg)
 {
+	bool result;
+
 	if (reg > SMA1303_FF_DEVICE_INDEX)
 		return false;
 
@@ -212,21 +221,29 @@ static bool sma1303_writeable_register(struct device *dev, unsigned int reg)
 	case SMA1303_8B_PLL_POST_N ... SMA1303_92_FDPEC_CTRL:
 	case SMA1303_94_BOOST_CTRL1 ... SMA1303_97_BOOST_CTRL4:
 	case SMA1303_A0_PAD_CTRL0 ... SMA1303_A7_CLK_MON:
-		return true;
+		result = true;
+		break;
 	default:
-		return false;
+		result = false;
 	}
+	return result;
 }
 
 static bool sma1303_volatile_register(struct device *dev, unsigned int reg)
 {
+	bool result;
+
 	switch (reg) {
 	case SMA1303_FA_STATUS1 ... SMA1303_FB_STATUS2:
+		result = true;
+		break;
 	case SMA1303_FF_DEVICE_INDEX:
-		return true;
+		result = true;
+		break;
 	default:
-		return false;
+		result = false;
 	}
+	return result;
 }
 
 /* DB scale conversion of speaker volume */
@@ -2447,7 +2464,12 @@ static int sma1303_dai_hw_params_amp(struct snd_pcm_substream *substream,
 	struct snd_soc_component *component = dai->component;
 	struct sma1303_priv *sma1303 = snd_soc_component_get_drvdata(component);
 	unsigned int input_format = 0;
-	unsigned int bclk = params_rate(params) * params_physical_width(params)
+	unsigned int bclk = 0;
+
+	if (sma1303->format == SND_SOC_DAIFMT_DSP_A)
+		bclk = params_rate(params) * sma1303->frame_size;
+	else
+		bclk = params_rate(params) * params_physical_width(params)
 			* params_channels(params);
 
 	dev_info(component->dev,
@@ -2503,48 +2525,6 @@ static int sma1303_dai_hw_params_amp(struct snd_pcm_substream *substream,
 		return -EINVAL;
 		}
 
-		/* Setting TDM Rx operation */
-		if (sma1303->format == SND_SOC_DAIFMT_DSP_A) {
-			regmap_update_bits(sma1303->regmap,
-				SMA1303_A4_TOP_MAN3,
-				O_FORMAT_MASK, O_FMT_TDM);
-
-			switch (params_physical_width(params)) {
-			case 16:
-			regmap_update_bits(sma1303->regmap, SMA1303_A6_TDM2,
-					TDM_DL_MASK, TDM_DL_16);
-			break;
-			case 32:
-			regmap_update_bits(sma1303->regmap, SMA1303_A6_TDM2,
-					TDM_DL_MASK, TDM_DL_32);
-			break;
-			default:
-			dev_err(component->dev, "%s not support TDM %d bit\n",
-				__func__, params_physical_width(params));
-			}
-
-			switch (params_channels(params)) {
-			case 4:
-			regmap_update_bits(sma1303->regmap, SMA1303_A6_TDM2,
-					TDM_N_SLOT_MASK, TDM_N_SLOT_4);
-			break;
-			case 8:
-			regmap_update_bits(sma1303->regmap, SMA1303_A6_TDM2,
-					TDM_N_SLOT_MASK, TDM_N_SLOT_8);
-			break;
-			default:
-			dev_err(component->dev, "%s not support TDM %d channel\n",
-				__func__, params_channels(params));
-			}
-			/* Select a slot to process TDM Rx data */
-			if (sma1303->tdm_slot_rx < params_channels(params))
-				regmap_update_bits(sma1303->regmap,
-					SMA1303_A5_TDM1, TDM_SLOT1_RX_POS_MASK,
-					(sma1303->tdm_slot_rx) << 3);
-			else
-				dev_err(component->dev, "%s Incorrect tdm-slot-rx %d set\n",
-					__func__, sma1303->tdm_slot_rx);
-		}
 	/* substream->stream is SNDRV_PCM_STREAM_CAPTURE */
 	} else {
 
@@ -2567,22 +2547,6 @@ static int sma1303_dai_hw_params_amp(struct snd_pcm_substream *substream,
 				"%s not support data bit : %d\n", __func__,
 						params_format(params));
 			return -EINVAL;
-		}
-
-		/* Setting TDM Tx operation */
-		if (sma1303->format == SND_SOC_DAIFMT_DSP_A) {
-			regmap_update_bits(sma1303->regmap, SMA1303_A5_TDM1,
-					TDM_CLK_POL_MASK, TDM_CLK_POL_RISE);
-			regmap_update_bits(sma1303->regmap, SMA1303_A5_TDM1,
-					TDM_TX_MODE_MASK, TDM_TX_MONO);
-			/* Select a slot to process TDM Tx data */
-			if (sma1303->tdm_slot_tx < params_channels(params))
-				regmap_update_bits(sma1303->regmap,
-					SMA1303_A6_TDM2, TDM_SLOT1_TX_POS_MASK,
-					(sma1303->tdm_slot_tx) << 3);
-			else
-				dev_err(component->dev, "%s Incorrect tdm-slot-tx %d set\n",
-					__func__, sma1303->tdm_slot_tx);
 		}
 	}
 
@@ -2688,24 +2652,24 @@ static int sma1303_dai_set_fmt_amp(struct snd_soc_dai *dai,
 
 	case SND_SOC_DAIFMT_CBS_CFS:
 		dev_info(component->dev,
-				"%s : %s\n", __func__, "I2S/TDM Slave mode");
-		/* I2S/TDM clock mode - slave mode */
+				"%s : %s\n", __func__, "I2S/TDM Device mode");
+		/* I2S/TDM clock mode - Device mode */
 		regmap_update_bits(sma1303->regmap, SMA1303_01_INPUT1_CTRL1,
-					MASTER_SLAVE_MASK, SLAVE_MODE);
+				CONTROLLER_DEVICE_MASK, DEVICE_MODE);
 
 		break;
 
 	case SND_SOC_DAIFMT_CBM_CFM:
 		dev_info(component->dev,
-				"%s : %s\n", __func__, "I2S/TDM Master mode");
-		/* I2S/TDM clock mode - master mode */
+			"%s : %s\n", __func__, "I2S/TDM Controller mode");
+		/* I2S/TDM clock mode - Controller mode */
 		regmap_update_bits(sma1303->regmap, SMA1303_01_INPUT1_CTRL1,
-					MASTER_SLAVE_MASK, MASTER_MODE);
+				CONTROLLER_DEVICE_MASK, CONTROLLER_MODE);
 		break;
 
 	default:
 		dev_err(component->dev,
-				"Unsupported Master/Slave : 0x%x\n", fmt);
+			"Unsupported Controller/Device : 0x%x\n", fmt);
 		return -EINVAL;
 	}
 
@@ -2720,7 +2684,7 @@ static int sma1303_dai_set_fmt_amp(struct snd_soc_dai *dai,
 		break;
 	default:
 		dev_err(component->dev,
-				"Unsupported Audio Interface Format : 0x%x\n", fmt);
+			"Unsupported Audio Interface Format : 0x%x\n", fmt);
 		return -EINVAL;
 	}
 
@@ -2758,11 +2722,82 @@ static int sma1303_dai_set_fmt_amp(struct snd_soc_dai *dai,
 	return 0;
 }
 
+static int sma1303_dai_set_tdm_slot(struct snd_soc_dai *dai,
+				unsigned int tx_mask, unsigned int rx_mask,
+				int slots, int slot_width)
+{
+	struct snd_soc_component *component = dai->component;
+	struct sma1303_priv *sma1303 = snd_soc_component_get_drvdata(component);
+
+	dev_info(component->dev, "%s : slots = %d, slot_width - %d\n",
+			__func__, slots, slot_width);
+
+	sma1303->frame_size = slot_width * slots;
+
+	/* Setting TDM Rx operation */
+	regmap_update_bits(sma1303->regmap, SMA1303_A4_TOP_MAN3,
+				O_FORMAT_MASK, O_FMT_TDM);
+
+	switch (slot_width) {
+	case 16:
+	regmap_update_bits(sma1303->regmap, SMA1303_A6_TDM2,
+					TDM_DL_MASK, TDM_DL_16);
+	break;
+	case 32:
+	regmap_update_bits(sma1303->regmap, SMA1303_A6_TDM2,
+					TDM_DL_MASK, TDM_DL_32);
+	break;
+	default:
+	dev_err(component->dev, "%s not support TDM %d slot_width\n",
+				__func__, slot_width);
+	}
+
+	switch (slots) {
+	case 4:
+	regmap_update_bits(sma1303->regmap, SMA1303_A6_TDM2,
+					TDM_N_SLOT_MASK, TDM_N_SLOT_4);
+	break;
+	case 8:
+	regmap_update_bits(sma1303->regmap, SMA1303_A6_TDM2,
+					TDM_N_SLOT_MASK, TDM_N_SLOT_8);
+	break;
+	default:
+	dev_err(component->dev, "%s not support TDM %d slots\n",
+				__func__, slots);
+	}
+
+	/* Select a slot to process TDM Rx data */
+	if (sma1303->tdm_slot_rx < slots)
+		regmap_update_bits(sma1303->regmap,
+			SMA1303_A5_TDM1, TDM_SLOT1_RX_POS_MASK,
+			(sma1303->tdm_slot_rx) << 3);
+	else
+		dev_err(component->dev, "%s Incorrect tdm-slot-rx %d set\n",
+				__func__, sma1303->tdm_slot_rx);
+
+	/* Setting TDM Tx operation */
+	regmap_update_bits(sma1303->regmap, SMA1303_A5_TDM1,
+					TDM_CLK_POL_MASK, TDM_CLK_POL_RISE);
+	regmap_update_bits(sma1303->regmap, SMA1303_A5_TDM1,
+					TDM_TX_MODE_MASK, TDM_TX_MONO);
+	/* Select a slot to process TDM Tx data */
+	if (sma1303->tdm_slot_tx < slots)
+		regmap_update_bits(sma1303->regmap,
+			SMA1303_A6_TDM2, TDM_SLOT1_TX_POS_MASK,
+			(sma1303->tdm_slot_tx) << 3);
+	else
+		dev_err(component->dev, "%s Incorrect tdm-slot-tx %d set\n",
+				__func__, sma1303->tdm_slot_tx);
+
+	return 0;
+}
+
 static const struct snd_soc_dai_ops sma1303_dai_ops_amp = {
 	.set_sysclk = sma1303_dai_set_sysclk_amp,
 	.set_fmt = sma1303_dai_set_fmt_amp,
 	.hw_params = sma1303_dai_hw_params_amp,
 	.digital_mute = sma1303_dai_digital_mute,
+	.set_tdm_slot = sma1303_dai_set_tdm_slot,
 };
 
 #define SMA1303_RATES SNDRV_PCM_RATE_8000_192000
@@ -3344,7 +3379,7 @@ static int sma1303_i2c_probe(struct i2c_client *client,
 	u32 value;
 	unsigned int device_info;
 
-	dev_info(&client->dev, "%s is here. Driver version REV016\n", __func__);
+	dev_info(&client->dev, "%s is here. Driver version REV017\n", __func__);
 
 	sma1303 = devm_kzalloc(&client->dev, sizeof(struct sma1303_priv),
 							GFP_KERNEL);
@@ -3359,8 +3394,9 @@ static int sma1303_i2c_probe(struct i2c_client *client,
 		dev_err(&client->dev,
 			"Failed to allocate register map: %d\n", ret);
 
-		if (sma1303->regmap)
-			regmap_exit(sma1303->regmap);
+		/* Comment out the cod due to GKI build error */
+//		if (sma1303->regmap)
+//			regmap_exit(sma1303->regmap);
 
 		devm_kfree(&client->dev, sma1303);
 
