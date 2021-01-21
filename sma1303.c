@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* sma1303.c -- sma1303 ALSA SoC Audio driver
  *
- * r010, 2020.03.13	- initial version  sma1303
+ * r016, 2020.07.16	- initial version  sma1303
  *
  * Copyright 2019 Silicon Mitus Corporation / Iron Device Corporation
  *
@@ -70,13 +70,17 @@ struct sma1303_priv {
 	unsigned int sys_clk_id;
 	unsigned int init_vol;
 	unsigned int cur_vol;
+	unsigned int tdm_slot_rx;
+	unsigned int tdm_slot_tx;
 	unsigned int tsdw_cnt;
 	unsigned int bst_vol_lvl_status;
 	unsigned int flt_vdd_gain_status;
+	bool sdo_bypass_flag;
 	bool amp_power_status;
 	bool force_amp_power_down;
 	bool stereo_two_chip;
 	bool impossible_bst_ctrl;
+	bool fault_reg_flag;
 	struct mutex lock;
 	struct delayed_work check_fault_work;
 	long check_fault_period;
@@ -86,10 +90,12 @@ struct sma1303_priv {
 	unsigned int rev_num;
 	unsigned int last_over_temp;
 	unsigned int last_ocp_val;
+	unsigned int last_bclk;
 };
 
 static struct sma1303_pll_match sma1303_pll_matches[] = {
 /* in_clk_name, out_clk_name, input_clk post_n, n, vco, p_cp */
+PLL_MATCH("1.411MHz",  "24.595MHz", 1411200,  0x07, 0xF4, 0x8B, 0x03),
 PLL_MATCH("1.536MHz",  "24.576MHz", 1536000,  0x07, 0xE0, 0x8B, 0x03),
 PLL_MATCH("3.072MHz",  "24.576MHz", 3072000,  0x07, 0x70, 0x8B, 0x03),
 PLL_MATCH("6.144MHz",  "24.576MHz", 6144000,  0x07, 0x70, 0x8B, 0x07),
@@ -339,6 +345,30 @@ static int power_down_control_put(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
+static int force_sdo_bypass_get(struct snd_kcontrol *kcontrol,
+		struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component =
+		snd_soc_kcontrol_component(kcontrol);
+	struct sma1303_priv *sma1303 = snd_soc_component_get_drvdata(component);
+
+	ucontrol->value.integer.value[0] = sma1303->sdo_bypass_flag;
+
+	return 0;
+}
+
+static int force_sdo_bypass_put(struct snd_kcontrol *kcontrol,
+		struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *component =
+		snd_soc_kcontrol_component(kcontrol);
+	struct sma1303_priv *sma1303 = snd_soc_component_get_drvdata(component);
+	int sel = (int)ucontrol->value.integer.value[0];
+
+	sma1303->sdo_bypass_flag = (bool)sel;
+
+	return 0;
+}
 
 /* InputCTRL1 [0x01] */
 static const char * const sma1303_input_format_text[] = {
@@ -1873,13 +1903,15 @@ static int sma1303_clk_mon_time_sel_put(struct snd_kcontrol *kcontrol,
 }
 
 static const struct snd_kcontrol_new sma1303_snd_controls[] = {
-/* Sytem CTRL [0x00] */
+/* System CTRL [0x00] */
 SOC_SINGLE("I2C Reg Reset(1:reset_0:normal)",
 		SMA1303_00_SYSTEM_CTRL, 1, 1, 0),
 SOC_SINGLE_EXT("Power Up(1:Up_0:Down)", SND_SOC_NOPM, 0, 1, 0,
 	power_up_down_control_get, power_up_down_control_put),
 SOC_SINGLE_EXT("Force AMP Power Down", SND_SOC_NOPM, 0, 1, 0,
 	power_down_control_get, power_down_control_put),
+SOC_SINGLE_EXT("Force SDO Bypass", SND_SOC_NOPM, 0, 1, 0,
+	force_sdo_bypass_get, force_sdo_bypass_put),
 
 /* Input CTRL1 [0x01] */
 SOC_SINGLE("I2S/PCM Clock mode(1:M_2:S)",
@@ -2310,31 +2342,37 @@ static int sma1303_dac_feedback_event(struct snd_soc_dapm_widget *w,
 		snd_soc_dapm_to_component(w->dapm);
 	struct sma1303_priv *sma1303 = snd_soc_component_get_drvdata(component);
 
-	switch (event) {
-	case SND_SOC_DAPM_PRE_PMU:
-		dev_info(component->dev, "%s : DAC feedback ON\n", __func__);
-		regmap_update_bits(sma1303->regmap,
-			SMA1303_09_OUTPUT_CTRL,
-				PORT_CONFIG_MASK|PORT_OUT_SEL_MASK,
-				OUTPUT_PORT_ENABLE|SPEAKER_PATH);
-		/* even if Capture stream on, Mixer should turn on
-		 * SDO output(1:High-Z,0:Normal output)
-		 */
-		regmap_update_bits(sma1303->regmap,
-			SMA1303_A3_TOP_MAN2, SDO_OUTPUT_MASK,
-				NORMAL_OUT);
-		break;
+	if (!sma1303->sdo_bypass_flag) {
+		switch (event) {
+		case SND_SOC_DAPM_PRE_PMU:
+			dev_info(component->dev,
+					"%s : DAC feedback ON\n", __func__);
+			regmap_update_bits(sma1303->regmap,
+				SMA1303_09_OUTPUT_CTRL,
+					PORT_CONFIG_MASK|PORT_OUT_SEL_MASK,
+					OUTPUT_PORT_ENABLE|SPEAKER_PATH);
+			/* even if Capture stream on, Mixer should turn on
+			 * SDO output(1:High-Z,0:Normal output)
+			 */
+			regmap_update_bits(sma1303->regmap,
+				SMA1303_A3_TOP_MAN2, SDO_OUTPUT_MASK,
+					NORMAL_OUT);
+			break;
 
-	case SND_SOC_DAPM_PRE_PMD:
-		dev_info(component->dev, "%s : DAC feedback OFF\n", __func__);
-		regmap_update_bits(sma1303->regmap,
-			SMA1303_09_OUTPUT_CTRL, PORT_OUT_SEL_MASK,
-				OUT_SEL_DISABLE);
-		regmap_update_bits(sma1303->regmap,
-			SMA1303_A3_TOP_MAN2, SDO_OUTPUT_MASK,
-				HIGH_Z_OUT);
-		break;
-	}
+		case SND_SOC_DAPM_PRE_PMD:
+			dev_info(component->dev,
+					"%s : DAC feedback OFF\n", __func__);
+			regmap_update_bits(sma1303->regmap,
+				SMA1303_09_OUTPUT_CTRL, PORT_OUT_SEL_MASK,
+					OUT_SEL_DISABLE);
+			regmap_update_bits(sma1303->regmap,
+				SMA1303_A3_TOP_MAN2, SDO_OUTPUT_MASK,
+					HIGH_Z_OUT);
+			break;
+		}
+	} else
+		dev_info(component->dev,
+				"%s : Force SDO Setting Bypass\n", __func__);
 
 	return 0;
 }
@@ -2360,34 +2398,35 @@ static const struct snd_soc_dapm_route sma1303_audio_map[] = {
 };
 
 static int sma1303_setup_pll(struct snd_soc_component *component,
-		struct snd_pcm_hw_params *params)
+		unsigned int bclk)
 {
 	struct sma1303_priv *sma1303 = snd_soc_component_get_drvdata(component);
 
 	int i = 0;
-	int calc_to_bclk = params_rate(params) * params_physical_width(params)
-					* params_channels(params);
 
-	dev_info(component->dev, "%s : rate = %d : bit size = %d : channel = %d\n",
-		__func__, params_rate(params), params_physical_width(params),
-			params_channels(params));
+	dev_info(component->dev, "%s : BCLK = %dHz\n",
+		__func__, bclk);
 
 	if (sma1303->sys_clk_id == SMA1303_PLL_CLKIN_MCLK) {
 		dev_info(component->dev, "%s : MCLK is not supported\n",
 		__func__);
 	} else if (sma1303->sys_clk_id == SMA1303_PLL_CLKIN_BCLK) {
+		for (i = 0; i < sma1303->num_of_pll_matches; i++) {
+			if (sma1303->pll_matches[i].input_clk == bclk)
+				break;
+		}
+		if (i == sma1303->num_of_pll_matches) {
+			dev_info(component->dev, "%s : No matching value between pll table and SCK\n",
+					__func__);
+			return -EINVAL;
+		}
+
 		/* PLL operation, PLL Clock, External Clock,
 		 * PLL reference SCK clock
 		 */
 		regmap_update_bits(sma1303->regmap, SMA1303_A2_TOP_MAN1,
 				PLL_PD_MASK|PLL_REF_CLK_MASK,
 				PLL_OPERATION|PLL_SCK);
-
-		for (i = 0; i < sma1303->num_of_pll_matches; i++) {
-			if (sma1303->pll_matches[i].input_clk ==
-					calc_to_bclk)
-				break;
-			}
 	}
 
 	regmap_write(sma1303->regmap, SMA1303_8B_PLL_POST_N,
@@ -2408,9 +2447,13 @@ static int sma1303_dai_hw_params_amp(struct snd_pcm_substream *substream,
 	struct snd_soc_component *component = dai->component;
 	struct sma1303_priv *sma1303 = snd_soc_component_get_drvdata(component);
 	unsigned int input_format = 0;
+	unsigned int bclk = params_rate(params) * params_physical_width(params)
+			* params_channels(params);
 
-	dev_info(component->dev, "%s : rate = %d : bit size = %d\n", __func__,
-		params_rate(params), params_width(params));
+	dev_info(component->dev,
+			"%s : rate = %d : bit size = %d : channel = %d\n",
+			__func__, params_rate(params), params_width(params),
+			params_channels(params));
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 
@@ -2418,9 +2461,17 @@ static int sma1303_dai_hw_params_amp(struct snd_pcm_substream *substream,
 		if (sma1303->force_amp_power_down == false &&
 			(sma1303->sys_clk_id == SMA1303_PLL_CLKIN_MCLK
 			|| sma1303->sys_clk_id == SMA1303_PLL_CLKIN_BCLK)) {
-			sma1303_shutdown(component);
-			sma1303_setup_pll(component, params);
-			sma1303_startup(component);
+
+			if (sma1303->last_bclk != bclk) {
+				if (sma1303->amp_power_status) {
+					sma1303_shutdown(component);
+					sma1303_setup_pll(component, bclk);
+					sma1303_startup(component);
+				} else
+					sma1303_setup_pll(component, bclk);
+
+				sma1303->last_bclk = bclk;
+			}
 		}
 
 		switch (params_rate(params)) {
@@ -2451,6 +2502,49 @@ static int sma1303_dai_hw_params_amp(struct snd_pcm_substream *substream,
 
 		return -EINVAL;
 		}
+
+		/* Setting TDM Rx operation */
+		if (sma1303->format == SND_SOC_DAIFMT_DSP_A) {
+			regmap_update_bits(sma1303->regmap,
+				SMA1303_A4_TOP_MAN3,
+				O_FORMAT_MASK, O_FMT_TDM);
+
+			switch (params_physical_width(params)) {
+			case 16:
+			regmap_update_bits(sma1303->regmap, SMA1303_A6_TDM2,
+					TDM_DL_MASK, TDM_DL_16);
+			break;
+			case 32:
+			regmap_update_bits(sma1303->regmap, SMA1303_A6_TDM2,
+					TDM_DL_MASK, TDM_DL_32);
+			break;
+			default:
+			dev_err(component->dev, "%s not support TDM %d bit\n",
+				__func__, params_physical_width(params));
+			}
+
+			switch (params_channels(params)) {
+			case 4:
+			regmap_update_bits(sma1303->regmap, SMA1303_A6_TDM2,
+					TDM_N_SLOT_MASK, TDM_N_SLOT_4);
+			break;
+			case 8:
+			regmap_update_bits(sma1303->regmap, SMA1303_A6_TDM2,
+					TDM_N_SLOT_MASK, TDM_N_SLOT_8);
+			break;
+			default:
+			dev_err(component->dev, "%s not support TDM %d channel\n",
+				__func__, params_channels(params));
+			}
+			/* Select a slot to process TDM Rx data */
+			if (sma1303->tdm_slot_rx < params_channels(params))
+				regmap_update_bits(sma1303->regmap,
+					SMA1303_A5_TDM1, TDM_SLOT1_RX_POS_MASK,
+					(sma1303->tdm_slot_rx) << 3);
+			else
+				dev_err(component->dev, "%s Incorrect tdm-slot-rx %d set\n",
+					__func__, sma1303->tdm_slot_rx);
+		}
 	/* substream->stream is SNDRV_PCM_STREAM_CAPTURE */
 	} else {
 
@@ -2473,6 +2567,22 @@ static int sma1303_dai_hw_params_amp(struct snd_pcm_substream *substream,
 				"%s not support data bit : %d\n", __func__,
 						params_format(params));
 			return -EINVAL;
+		}
+
+		/* Setting TDM Tx operation */
+		if (sma1303->format == SND_SOC_DAIFMT_DSP_A) {
+			regmap_update_bits(sma1303->regmap, SMA1303_A5_TDM1,
+					TDM_CLK_POL_MASK, TDM_CLK_POL_RISE);
+			regmap_update_bits(sma1303->regmap, SMA1303_A5_TDM1,
+					TDM_TX_MODE_MASK, TDM_TX_MONO);
+			/* Select a slot to process TDM Tx data */
+			if (sma1303->tdm_slot_tx < params_channels(params))
+				regmap_update_bits(sma1303->regmap,
+					SMA1303_A6_TDM2, TDM_SLOT1_TX_POS_MASK,
+					(sma1303->tdm_slot_tx) << 3);
+			else
+				dev_err(component->dev, "%s Incorrect tdm-slot-tx %d set\n",
+					__func__, sma1303->tdm_slot_tx);
 		}
 	}
 
@@ -2578,8 +2688,8 @@ static int sma1303_dai_set_fmt_amp(struct snd_soc_dai *dai,
 
 	case SND_SOC_DAIFMT_CBS_CFS:
 		dev_info(component->dev,
-				"%s : %s\n", __func__, "I2S slave mode");
-		/* I2S/PCM clock mode - slave mode */
+				"%s : %s\n", __func__, "I2S/TDM Slave mode");
+		/* I2S/TDM clock mode - slave mode */
 		regmap_update_bits(sma1303->regmap, SMA1303_01_INPUT1_CTRL1,
 					MASTER_SLAVE_MASK, SLAVE_MODE);
 
@@ -2587,15 +2697,15 @@ static int sma1303_dai_set_fmt_amp(struct snd_soc_dai *dai,
 
 	case SND_SOC_DAIFMT_CBM_CFM:
 		dev_info(component->dev,
-				"%s : %s\n", __func__, "I2S master mode");
-		/* I2S/PCM clock mode - master mode */
+				"%s : %s\n", __func__, "I2S/TDM Master mode");
+		/* I2S/TDM clock mode - master mode */
 		regmap_update_bits(sma1303->regmap, SMA1303_01_INPUT1_CTRL1,
 					MASTER_SLAVE_MASK, MASTER_MODE);
 		break;
 
 	default:
 		dev_err(component->dev,
-				"Unsupported MASTER/SLAVE : 0x%x\n", fmt);
+				"Unsupported Master/Slave : 0x%x\n", fmt);
 		return -EINVAL;
 	}
 
@@ -2604,12 +2714,44 @@ static int sma1303_dai_set_fmt_amp(struct snd_soc_dai *dai,
 	case SND_SOC_DAIFMT_I2S:
 	case SND_SOC_DAIFMT_RIGHT_J:
 	case SND_SOC_DAIFMT_LEFT_J:
+	case SND_SOC_DAIFMT_DSP_A:
+	case SND_SOC_DAIFMT_DSP_B:
 		sma1303->format = fmt & SND_SOC_DAIFMT_FORMAT_MASK;
 		break;
-
 	default:
 		dev_err(component->dev,
-				"Unsupported I2S FORMAT : 0x%x\n", fmt);
+				"Unsupported Audio Interface Format : 0x%x\n", fmt);
+		return -EINVAL;
+	}
+
+	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
+
+	case SND_SOC_DAIFMT_IB_NF:
+		dev_info(component->dev, "%s : %s\n",
+			__func__, "Invert BCLK + Normal Frame");
+		regmap_update_bits(sma1303->regmap, SMA1303_01_INPUT1_CTRL1,
+					SCK_RISING_MASK, SCK_RISING_EDGE);
+		break;
+	case SND_SOC_DAIFMT_IB_IF:
+		dev_info(component->dev, "%s : %s\n",
+			__func__, "Invert BCLK + Invert Frame");
+		regmap_update_bits(sma1303->regmap, SMA1303_01_INPUT1_CTRL1,
+					LEFTPOL_MASK|SCK_RISING_MASK,
+					HIGH_FIRST_CH|SCK_RISING_EDGE);
+		break;
+	case SND_SOC_DAIFMT_NB_IF:
+		dev_info(component->dev, "%s : %s\n",
+			__func__, "Normal BCLK + Invert Frame");
+		regmap_update_bits(sma1303->regmap, SMA1303_01_INPUT1_CTRL1,
+					LEFTPOL_MASK, HIGH_FIRST_CH);
+		break;
+	case SND_SOC_DAIFMT_NB_NF:
+		dev_info(component->dev, "%s : %s\n",
+			__func__, "Normal BCLK + Normal Frame");
+		break;
+	default:
+		dev_err(component->dev,
+				"Unsupported Bit & Frameclock : 0x%x\n", fmt);
 		return -EINVAL;
 	}
 
@@ -2693,6 +2835,7 @@ static void sma1303_check_fault_worker(struct work_struct *work)
 		container_of(work, struct sma1303_priv, check_fault_work.work);
 	int ret;
 	unsigned int over_temp, ocp_val, uvlo_val;
+	bool fault_val_flag = false;
 
 	mutex_lock(&sma1303->lock);
 
@@ -2744,6 +2887,7 @@ static void sma1303_check_fault_worker(struct work_struct *work)
 				SMA1303_0A_SPK_VOL, sma1303->cur_vol + 6);
 
 		sma1303->tsdw_cnt++;
+		fault_val_flag = true;
 	} else if (sma1303->tsdw_cnt) {
 		regmap_write(sma1303->regmap,
 			SMA1303_0A_SPK_VOL, sma1303->init_vol);
@@ -2754,22 +2898,27 @@ static void sma1303_check_fault_worker(struct work_struct *work)
 	if (~over_temp & OT2_OK_STATUS) {
 		dev_crit(sma1303->dev,
 			"%s : OT2(Over Temperature Level 2)\n", __func__);
+		fault_val_flag = true;
 	}
 	if (ocp_val & OCP_SPK_STATUS) {
 		dev_crit(sma1303->dev,
 			"%s : OCP_SPK(Over Current Protect SPK)\n", __func__);
+		fault_val_flag = true;
 	}
 	if (ocp_val & OCP_BST_STATUS) {
 		dev_crit(sma1303->dev,
 			"%s : OCP_BST(Over Current Protect Boost)\n", __func__);
+		fault_val_flag = true;
 	}
 	if ((ocp_val & CLK_MON_STATUS) && (sma1303->amp_power_status)) {
 		dev_crit(sma1303->dev,
 			"%s : CLK_FAULT(No clock input)\n", __func__);
+		fault_val_flag = true;
 	}
 	if (uvlo_val & UVLO_BST_STATUS) {
 		dev_crit(sma1303->dev,
 			"%s : UVLO(Under Voltage Lock Out)\n", __func__);
+		fault_val_flag = true;
 	}
 
 	if ((over_temp != sma1303->last_over_temp) ||
@@ -2792,6 +2941,85 @@ static void sma1303_check_fault_worker(struct work_struct *work)
 				&sma1303->check_fault_work,
 					CHECK_PERIOD_TIME * HZ);
 	}
+
+	if (fault_val_flag && sma1303->fault_reg_flag) {
+		int i, j = 0;
+		char reg[256];
+		char reg_str[12][50] = { };
+		bool state;
+
+		regmap_bulk_read(sma1303->regmap,
+			SMA1303_00_SYSTEM_CTRL, reg, ARRAY_SIZE(reg));
+		dev_crit(sma1303->dev, "\n");
+		dev_crit(sma1303->dev, "sma1303 register values\n");
+		dev_crit(sma1303->dev, "\t   0\t1\t2\t3\t4\t5\t6\t7\t8\t9\tA\tB\tC\tD\tE\tF\n");
+		dev_crit(sma1303->dev, "\t  ---------------------------------------------------------------------------------------------------------\n");
+		for (i = 0; i <= SMA1303_A7_CLK_MON; i++) {
+			switch (i) {
+			case SMA1303_00_SYSTEM_CTRL ... SMA1303_04_INPUT1_CTRL4:
+			case SMA1303_09_OUTPUT_CTRL
+				... SMA1303_0E_MUTE_VOL_CTRL:
+			case SMA1303_10_SYSTEM_CTRL1
+				... SMA1303_12_SYSTEM_CTRL3:
+			case SMA1303_14_MODULATOR ... SMA1303_1B_BASS_SPK7:
+			case SMA1303_23_COMP_LIM1 ... SMA1303_26_COMP_LIM4:
+			case SMA1303_33_SDM_CTRL ... SMA1303_34_OTP_DATA1:
+			case SMA1303_36_PROTECTION  ... SMA1303_38_OTP_TRM0:
+			case SMA1303_3B_TEST1  ... SMA1303_3F_ATEST2:
+			case SMA1303_8B_PLL_POST_N ... SMA1303_92_FDPEC_CTRL:
+			case SMA1303_94_BOOST_CTRL1 ... SMA1303_97_BOOST_CTRL4:
+			case SMA1303_A0_PAD_CTRL0 ... SMA1303_A7_CLK_MON:
+				state = true;
+				break;
+			default:
+				state = false;
+			}
+			if (state == false)
+				sprintf(reg_str[j], "%sX\t", reg_str[j]);
+			else
+				sprintf(reg_str[j], "%s%02X\t",
+					reg_str[j], reg[i]);
+
+			if (i%16 == 15 || i == SMA1303_A7_CLK_MON) {
+				dev_crit(sma1303->dev, "%X  |%s",
+					j, reg_str[j]);
+				j++;
+			}
+		}
+
+		for (i = SMA1303_FA_STATUS1-10;
+				i <= SMA1303_FF_DEVICE_INDEX; i++) {
+			switch (i) {
+			case SMA1303_FA_STATUS1 ... SMA1303_FB_STATUS2:
+			case SMA1303_FF_DEVICE_INDEX:
+				state = true;
+				break;
+			default:
+				state = false;
+			}
+			if (state == false)
+				sprintf(reg_str[j], "%sX\t", reg_str[j]);
+			else
+				sprintf(reg_str[j], "%s%02X\t",
+					reg_str[j], reg[i]);
+
+			if (i == SMA1303_FF_DEVICE_INDEX) {
+				dev_crit(sma1303->dev, "F  |%s",  reg_str[j]);
+				j++;
+			}
+		}
+		sma1303->fault_reg_flag = false;
+	}
+
+	if (!(~over_temp & OT1_OK_STATUS) && !(~over_temp & OT2_OK_STATUS)
+			&& !(ocp_val & OCP_SPK_STATUS)
+			&& !(ocp_val & OCP_BST_STATUS)
+			&& !(ocp_val & CLK_MON_STATUS)
+			&& !(uvlo_val & UVLO_BST_STATUS)) {
+		fault_val_flag = false;
+		sma1303->fault_reg_flag = true;
+	}
+
 	mutex_unlock(&sma1303->lock);
 }
 
@@ -3116,15 +3344,13 @@ static int sma1303_i2c_probe(struct i2c_client *client,
 	u32 value;
 	unsigned int device_info;
 
-	dev_info(&client->dev, "%s is here. Driver version REV010\n", __func__);
+	dev_info(&client->dev, "%s is here. Driver version REV016\n", __func__);
 
 	sma1303 = devm_kzalloc(&client->dev, sizeof(struct sma1303_priv),
 							GFP_KERNEL);
 
-	if (!sma1303) {
-		devm_kfree(&client->dev, sma1303);
+	if (!sma1303)
 		return -ENOMEM;
-	}
 
 	sma1303->regmap = devm_regmap_init_i2c(client, &sma_i2c_regmap);
 
@@ -3164,6 +3390,24 @@ static int sma1303_i2c_probe(struct i2c_client *client,
 		} else {
 			dev_info(&client->dev, "Boost control setting is possible\n");
 				sma1303->impossible_bst_ctrl = false;
+		}
+		if (!of_property_read_u32(np, "tdm-slot-rx", &value)) {
+			dev_info(&client->dev,
+				"tdm slot rx is '%d' from DT\n", value);
+			sma1303->tdm_slot_rx = value;
+		} else {
+			dev_info(&client->dev,
+				"Default setting of tdm slot rx is '0'\n");
+			sma1303->tdm_slot_rx = 0;
+		}
+		if (!of_property_read_u32(np, "tdm-slot-tx", &value)) {
+			dev_info(&client->dev,
+				"tdm slot tx is '%d' from DT\n", value);
+			sma1303->tdm_slot_tx = value;
+		} else {
+			dev_info(&client->dev,
+				"Default setting of tdm slot tx is '0'\n");
+			sma1303->tdm_slot_tx = 0;
 		}
 		if (!of_property_read_u32(np, "sys-clk-id", &value)) {
 			switch (value) {
@@ -3210,6 +3454,7 @@ static int sma1303_i2c_probe(struct i2c_client *client,
 	sma1303->last_ocp_val = 0x0A;
 	sma1303->tsdw_cnt = 0;
 	sma1303->cur_vol = sma1303->init_vol;
+	sma1303->last_bclk = 0;
 
 	INIT_DELAYED_WORK(&sma1303->check_fault_work,
 		sma1303_check_fault_worker);
@@ -3223,10 +3468,11 @@ static int sma1303_i2c_probe(struct i2c_client *client,
 
 	i2c_set_clientdata(client, sma1303);
 
+	sma1303->sdo_bypass_flag = false;
 	sma1303->force_amp_power_down = false;
 	sma1303->amp_power_status = false;
 	sma1303->check_fault_status = true;
-
+	sma1303->fault_reg_flag = true;
 	sma1303->pll_matches = sma1303_pll_matches;
 	sma1303->num_of_pll_matches =
 		ARRAY_SIZE(sma1303_pll_matches);
@@ -3236,8 +3482,10 @@ static int sma1303_i2c_probe(struct i2c_client *client,
 
 	if (ret) {
 		dev_err(&client->dev, "Failed to register component");
-		devm_kfree(&client->dev, sma1303);
 		snd_soc_unregister_component(&client->dev);
+
+		if (sma1303)
+			devm_kfree(&client->dev, sma1303);
 
 		return ret;
 	}
@@ -3264,10 +3512,10 @@ static int sma1303_i2c_remove(struct i2c_client *client)
 
 	cancel_delayed_work_sync(&sma1303->check_fault_work);
 
+	snd_soc_unregister_component(&client->dev);
+
 	if (sma1303)
 		devm_kfree(&client->dev, sma1303);
-
-	snd_soc_unregister_component(&client->dev);
 
 	return 0;
 }

@@ -34,6 +34,8 @@
 				compatible = "siliconmitus,sma1303";
 				reg = <0x1e>;
 				init-vol = <0x31>;
+				tdm-slot-rx = <0>;
+				tdm-slot-tx = <0>;
 				//stereo-two-chip;
 				/* EXTERNAL_CLOCK_19_2   : 0x00,
 				 * EXTERNAL_CLOCK_24_576 : 0x01,
