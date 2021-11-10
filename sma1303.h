@@ -1,7 +1,7 @@
 /*
  * sma1303.h -- sma1303 ALSA SoC Audio driver
  *
- * r016, 2020.07.16
+ * r017, 2021.11.10
  *
  * Copyright 2019 Silicon Mitus Corporation / Iron Device Corporation
  *
@@ -111,10 +111,10 @@
 #define POWER_OFF (0<<0)
 #define POWER_ON (1<<0)
 
-/* INTPUT CTRL1 : 0x01 */
-#define MASTER_SLAVE_MASK (1<<7)
-#define SLAVE_MODE	(0<<7)
-#define MASTER_MODE	(1<<7)
+/* Controller / Device Setting */
+#define CONTROLLER_DEVICE_MASK (1<<7)
+#define DEVICE_MODE	(0<<7)
+#define CONTROLLER_MODE	(1<<7)
 
 #define I2S_MODE_MASK	(7<<4)
 #define STANDARD_I2S	(0<<4)

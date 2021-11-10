@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* sma1303.c -- sma1303 ALSA SoC Audio driver
  *
- * r016, 2020.07.16	- initial version  sma1303
+ * r017, 2021.11.10	- initial version  sma1303
  *
  * Copyright 2019 Silicon Mitus Corporation / Iron Device Corporation
  *
@@ -2688,24 +2688,24 @@ static int sma1303_dai_set_fmt_amp(struct snd_soc_dai *dai,
 
 	case SND_SOC_DAIFMT_CBS_CFS:
 		dev_info(component->dev,
-				"%s : %s\n", __func__, "I2S/TDM Slave mode");
-		/* I2S/TDM clock mode - slave mode */
+				"%s : %s\n", __func__, "I2S/TDM Device mode");
+		/* I2S/PCM clock mode - Device mode */
 		regmap_update_bits(sma1303->regmap, SMA1303_01_INPUT1_CTRL1,
-					MASTER_SLAVE_MASK, SLAVE_MODE);
+					CONTROLLER_DEVICE_MASK, DEVICE_MODE);
 
 		break;
 
 	case SND_SOC_DAIFMT_CBM_CFM:
 		dev_info(component->dev,
-				"%s : %s\n", __func__, "I2S/TDM Master mode");
-		/* I2S/TDM clock mode - master mode */
+				"%s : %s\n", __func__, "I2S/TDM Controller mode");
+		/* I2S/PCM clock mode - Controller mode */
 		regmap_update_bits(sma1303->regmap, SMA1303_01_INPUT1_CTRL1,
-					MASTER_SLAVE_MASK, MASTER_MODE);
+					CONTROLLER_DEVICE_MASK, CONTROLLER_MODE);
 		break;
 
 	default:
 		dev_err(component->dev,
-				"Unsupported Master/Slave : 0x%x\n", fmt);
+				"Unsupported Controller/Device : 0x%x\n", fmt);
 		return -EINVAL;
 	}
 
@@ -3344,7 +3344,7 @@ static int sma1303_i2c_probe(struct i2c_client *client,
 	u32 value;
 	unsigned int device_info;
 
-	dev_info(&client->dev, "%s is here. Driver version REV016\n", __func__);
+	dev_info(&client->dev, "%s is here. Driver version REV017\n", __func__);
 
 	sma1303 = devm_kzalloc(&client->dev, sizeof(struct sma1303_priv),
 							GFP_KERNEL);
